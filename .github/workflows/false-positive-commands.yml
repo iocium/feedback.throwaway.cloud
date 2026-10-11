@@ -1,0 +1,120 @@
+name: Handle false-positive slash commands
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  process:
+    # Only act on false-positive reports in the feedback repo
+    if: |
+      contains(github.event.issue.labels.*.name, 'false-positive') ||
+      contains(github.event.issue.labels.*.name, 'data-classification')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Process slash command
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+            const comment = context.payload.comment;
+
+            // Only process slash commands from maintainers, members, or owners.
+            const allowed = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            if (!allowed.includes(comment.author_association)) {
+              console.log(`Ignoring comment from ${comment.user.login} (${comment.author_association})`);
+              return;
+            }
+
+            // Look for a command like /allowlist, /false_positive, /remove
+            const cmdMatch = comment.body.match(/(?:^|\s)\/(allowlist|false_positive|remove)(?:\s|$)/i);
+            if (!cmdMatch) {
+              console.log('No recognised slash command found');
+              return;
+            }
+            const cmd = cmdMatch[1].toLowerCase();
+
+            // Extract candidate domains from the issue title and body.
+            const text = `${issue.title || ''}\n${issue.body || ''}`;
+            const candidates = [
+              ...text.matchAll(
+                /(?:\b|@|\[)([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+)(?:\b|\]|\?|!|,|;|:|\.\s|\s|$)/gi
+              ),
+            ]
+              .map((m) => m[1].toLowerCase().trim())
+              .filter((d) => {
+                if (d.length > 253) return false;
+                const labels = d.split('.');
+                if (labels.length < 2) return false;
+                return labels.every((l) => l.length > 0 && l.length <= 63);
+              });
+            const domains = [...new Set(candidates)];
+
+            if (domains.length === 0) {
+              console.log('No domains found in issue');
+              return;
+            }
+
+            const endpoint = 'https://throwaway.cloud';
+            const token = process.env.THROWAWAY_TOKEN;
+            const issueUrl = issue.html_url;
+
+            const results = [];
+            for (const domain of domains) {
+              let success = false;
+              let action = '';
+
+              if (cmd === 'remove') {
+                action = 'removed from disposable list';
+                const resp = await fetch(`${endpoint}/api/admin/submit`, {
+                  method: 'DELETE',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                  body: JSON.stringify({ domain }),
+                });
+                success = resp.ok;
+              } else {
+                const type = cmd === 'allowlist' ? 'allowlist' : 'false_positive';
+                action = type === 'allowlist' ? 'added as allowlist override' : 'added as false_positive override';
+                const body = {
+                  entries: [
+                    {
+                      hostname: domain,
+                      type,
+                      issue: issueUrl,
+                      tags: ['community'],
+                    },
+                  ],
+                };
+                const resp = await fetch(`${endpoint}/api/admin/overrides/bulk`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                  body: JSON.stringify(body),
+                });
+                const data = await resp.json().catch(() => ({}));
+                success = resp.ok && data.success === true;
+              }
+
+              results.push({ domain, action, success });
+            }
+
+            const summary = results
+              .map((r) => `- ${r.domain}: ${r.success ? '✅' : '❌'} ${r.action}`)
+              .join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: `Processed \`/${cmd}\` for ${domains.length} domain(s):\n${summary}`,
+            });
+        env:
+          THROWAWAY_TOKEN: ${{ secrets.THROWAWAY_TOKEN }}
