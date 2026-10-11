@@ -6,10 +6,12 @@ on:
 
 jobs:
   process:
-    # Only act on false-positive reports in the feedback repo
+    # Fail closed: only run when the required config is present and the issue
+    # is clearly a false-positive report.
     if: |
-      (startsWith(github.event.issue.title, '[False Positive]') ||
-       startsWith(github.event.issue.title, '[False Positive')) &&
+      vars.ALLOWED_USERS != '' &&
+      secrets.THROWAWAY_TOKEN != '' &&
+      startsWith(github.event.issue.title, '[False Positive]') &&
       (contains(github.event.issue.labels.*.name, 'false-positive') ||
        contains(github.event.issue.labels.*.name, 'data-classification'))
     runs-on: ubuntu-latest
@@ -24,14 +26,15 @@ jobs:
             const issue = context.payload.issue;
             const comment = context.payload.comment;
 
-            // Only process commands from an explicitly allow-listed set of users.
+            // Fail closed: require both a token and an allow-list.
+            const token = process.env.THROWAWAY_TOKEN;
             const allowedUsers = (process.env.ALLOWED_USERS || '')
               .split(',')
               .map((s) => s.trim().toLowerCase())
               .filter(Boolean);
 
-            if (allowedUsers.length === 0) {
-              console.log('ALLOWED_USERS is not configured; no commands will be executed');
+            if (!token || allowedUsers.length === 0) {
+              console.log('Missing THROWAWAY_TOKEN or ALLOWED_USERS; no commands will be executed');
               return;
             }
 
@@ -101,7 +104,6 @@ jobs:
             }
 
             const endpoint = 'https://throwaway.cloud';
-            const token = process.env.THROWAWAY_TOKEN;
             const issueUrl = issue.html_url;
 
             const results = [];
