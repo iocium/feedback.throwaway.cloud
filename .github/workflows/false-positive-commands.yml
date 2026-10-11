@@ -8,8 +8,10 @@ jobs:
   process:
     # Only act on false-positive reports in the feedback repo
     if: |
-      contains(github.event.issue.labels.*.name, 'false-positive') ||
-      contains(github.event.issue.labels.*.name, 'data-classification')
+      (startsWith(github.event.issue.title, '[False Positive]') ||
+       startsWith(github.event.issue.title, '[False Positive')) &&
+      (contains(github.event.issue.labels.*.name, 'false-positive') ||
+       contains(github.event.issue.labels.*.name, 'data-classification'))
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -22,20 +24,50 @@ jobs:
             const issue = context.payload.issue;
             const comment = context.payload.comment;
 
-            // Only process slash commands from maintainers, members, or owners.
-            const allowed = ['OWNER', 'MEMBER', 'COLLABORATOR'];
-            if (!allowed.includes(comment.author_association)) {
-              console.log(`Ignoring comment from ${comment.user.login} (${comment.author_association})`);
+            // Only process commands from an explicitly allow-listed set of users.
+            const allowedUsers = (process.env.ALLOWED_USERS || '')
+              .split(',')
+              .map((s) => s.trim().toLowerCase())
+              .filter(Boolean);
+
+            if (allowedUsers.length === 0) {
+              console.log('ALLOWED_USERS is not configured; no commands will be executed');
               return;
             }
 
-            // Look for a command like /allowlist, /false_positive, /remove
-            const cmdMatch = comment.body.match(/(?:^|\s)\/(allowlist|false_positive|remove)(?:\s|$)/i);
+            const username = comment.user.login.toLowerCase();
+            if (!allowedUsers.includes(username)) {
+              console.log(`Ignoring comment from ${comment.user.login} (not in ALLOWED_USERS)`);
+              return;
+            }
+
+            // Look for a command like /allowlist, /false_positive, /remove, /dry-run
+            const cmdMatch = comment.body.match(/(?:^|\s)\/(allowlist|false_positive|remove|dry-run)(?:\s|$)/i);
             if (!cmdMatch) {
               console.log('No recognised slash command found');
               return;
             }
             const cmd = cmdMatch[1].toLowerCase();
+            const dryRun = cmd === 'dry-run';
+
+            // Always pick the action that would be performed, even in dry-run mode,
+            // so the summary is accurate. If the command is /dry-run, we default to
+            // showing what a /false_positive change would look like.
+            let action = cmd;
+            if (dryRun) {
+              // Try to infer intended action from the rest of the comment.
+              const intentMatch = comment.body.match(/(?:^|\s)\/(allowlist|false_positive|remove)(?:\s|$)/ig);
+              if (intentMatch) {
+                action = intentMatch[intentMatch.length - 1].toLowerCase().replace(/\//g, '').trim();
+              } else {
+                action = 'false_positive';
+              }
+            }
+
+            if (!['allowlist', 'false_positive', 'remove'].includes(action)) {
+              console.log(`Unknown or unsupported action: ${action}`);
+              return;
+            }
 
             // Extract candidate domains from the issue title and body.
             const text = `${issue.title || ''}\n${issue.body || ''}`;
@@ -51,7 +83,17 @@ jobs:
                 if (labels.length < 2) return false;
                 return labels.every((l) => l.length > 0 && l.length <= 63);
               });
-            const domains = [...new Set(candidates)];
+
+            // Drop common reference domains that sometimes appear in issue bodies.
+            const ignored = new Set([
+              'github.com',
+              'raw.githubusercontent.com',
+              'gist.github.com',
+              'www.w3.org',
+              'example.com',
+              'localhost',
+            ]);
+            const domains = [...new Set(candidates)].filter((d) => !ignored.has(d));
 
             if (domains.length === 0) {
               console.log('No domains found in issue');
@@ -65,10 +107,16 @@ jobs:
             const results = [];
             for (const domain of domains) {
               let success = false;
-              let action = '';
+              let summaryAction = '';
 
-              if (cmd === 'remove') {
-                action = 'removed from disposable list';
+              if (dryRun) {
+                summaryAction =
+                  action === 'remove'
+                    ? 'would be removed from disposable list'
+                    : `would be added as ${action} override`;
+                success = true;
+              } else if (action === 'remove') {
+                summaryAction = 'removed from disposable list';
                 const resp = await fetch(`${endpoint}/api/admin/submit`, {
                   method: 'DELETE',
                   headers: {
@@ -79,13 +127,12 @@ jobs:
                 });
                 success = resp.ok;
               } else {
-                const type = cmd === 'allowlist' ? 'allowlist' : 'false_positive';
-                action = type === 'allowlist' ? 'added as allowlist override' : 'added as false_positive override';
+                summaryAction = `added as ${action} override`;
                 const body = {
                   entries: [
                     {
                       hostname: domain,
-                      type,
+                      type: action,
                       issue: issueUrl,
                       tags: ['community'],
                     },
@@ -103,18 +150,23 @@ jobs:
                 success = resp.ok && data.success === true;
               }
 
-              results.push({ domain, action, success });
+              results.push({ domain, action: summaryAction, success });
             }
 
             const summary = results
               .map((r) => `- ${r.domain}: ${r.success ? '✅' : '❌'} ${r.action}`)
               .join('\n');
 
+            const header = dryRun
+              ? `Dry-run for \`/${action}\` (${domains.length} domain(s))`
+              : `Processed \`/${action}\` for ${domains.length} domain(s)`;
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issue.number,
-              body: `Processed \`/${cmd}\` for ${domains.length} domain(s):\n${summary}`,
+              body: `${header}\n${summary}`,
             });
         env:
           THROWAWAY_TOKEN: ${{ secrets.THROWAWAY_TOKEN }}
+          ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
